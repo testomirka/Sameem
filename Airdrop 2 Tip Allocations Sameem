@@ -1,0 +1,124 @@
+WITH profile AS (
+    SELECT
+        profile.fid,
+        profile.fname,
+        profile.display_name,
+        profile.avatar_url,
+        ROW_NUMBER() OVER (PARTITION BY profile.fid ORDER BY LENGTH(profile.verified_addresses) DESC NULLS LAST) AS rn
+    FROM dune.neynar.dataset_farcaster_profile_with_addresses profile
+),
+verified_addresses AS (
+    SELECT
+        from_hex(
+            CAST(JSON_EXTRACT(claim, '$.address') AS VARCHAR)
+        ) AS address,
+        fid,
+        ROW_NUMBER() OVER (PARTITION BY fid ORDER BY timestamp DESC NULLS LAST) AS rn
+    FROM
+        dune.neynar.dataset_farcaster_verifications
+    WHERE
+        deleted_at IS NULL
+        AND timestamp <= CURRENT_DATE
+),
+original_casts AS (
+    SELECT
+        casts.fid,
+        casts.hash,
+        casts.text,
+        COUNT(DISTINCT rxn.fid) AS reaction_count,
+        MIN(casts.timestamp) AS first_cast_timestamp
+    FROM
+        dune.neynar.dataset_farcaster_casts casts
+    INNER JOIN
+        dune.neynar.dataset_farcaster_reactions rxn ON rxn.target_hash = casts.hash
+    WHERE
+        casts.parent_hash IS NULL
+        AND casts.deleted_at IS NULL
+        AND rxn.deleted_at IS NULL
+    GROUP BY
+        casts.fid,
+        casts.hash,
+        casts.text
+),
+user_stats AS (
+    SELECT
+        fid,
+        CASE
+            WHEN COUNT(*) >= 1000 THEN APPROX_PERCENTILE(reaction_count, 0.7)
+            WHEN COUNT(*) >= 500 THEN APPROX_PERCENTILE(reaction_count, 0.6)
+            WHEN COUNT(*) >= 100 THEN APPROX_PERCENTILE(reaction_count, 0.5)
+            WHEN COUNT(*) >= 50 THEN APPROX_PERCENTILE(reaction_count, 0.4)
+            ELSE APPROX_PERCENTILE(reaction_count, 0.2)
+        END AS median_reactions,
+        SUM(reaction_count) / COUNT(*) AS reactions_per_cast,
+        MIN(first_cast_timestamp) AS first_cast_timestamp
+    FROM
+        original_casts
+    GROUP BY
+        fid
+    HAVING
+        --
+        -- Should have at least 3 original casts
+        --
+        COUNT(*) >= 3
+),
+address_overrides AS (
+    SELECT
+        4167 AS fid,
+        0xCEEd9585854F12F81A0103861b83b995A64AD915 AS address
+    UNION ALL
+    SELECT
+        18685 AS fid,
+        0xfb4eecef04f1d45ead80a7a471d60b38b14eaa9a AS address
+        UNION ALL
+    SELECT
+        206 AS fid,
+        0x5b93ff82faaf241c15997ea3975419dddd8362c5 AS address
+),
+allowance AS (
+    SELECT
+        stats.fid,
+        profile.fname,
+        profile.display_name,
+        stats.first_cast_timestamp,
+        ROUND(LOG10( date_diff('day', stats.first_cast_timestamp, CURRENT_TIMESTAMP) + 10 ), 0) AS retroactive_boost,
+        stats.reactions_per_cast,
+        ROUND(
+            EXP(LOG( 3, stats.median_reactions * 1000))
+            * ROUND(LOG10( date_diff('day', stats.first_cast_timestamp, CURRENT_TIMESTAMP) + 10 ), 0)
+        , 0) AS tip_allowance,
+        COALESCE(ovrrd.address, wallet.address) AS wallet_address,
+        profile.avatar_url
+    FROM
+        user_stats stats
+    LEFT JOIN
+        profile ON profile.fid = stats.fid
+        AND profile.rn = 1
+    LEFT JOIN
+        verified_addresses wallet ON wallet.fid = stats.fid
+        AND wallet.rn = 1
+    LEFT JOIN
+        address_overrides ovrrd ON ovrrd.fid = stats.fid
+    WHERE
+        wallet.address IS NOT NULL
+        AND profile.display_name IS NOT NULL
+        AND profile.avatar_url IS NOT NULL
+)
+SELECT
+    ROW_NUMBER() OVER (ORDER BY tip_allowance DESC, first_cast_timestamp) AS user_rank,
+    fid,
+    fname,
+    display_name,
+    --first_cast_timestamp,
+    --retroactive_boost,
+    reactions_per_cast,
+    tip_allowance,
+    wallet_address,
+    avatar_url,
+    SUM(tip_allowance) OVER () AS total_degen_per_day
+FROM
+    allowance
+ORDER BY 
+    tip_allowance DESC
+;
+    
